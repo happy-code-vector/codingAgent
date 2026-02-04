@@ -157,7 +157,7 @@ class AgentConfig:
     SAVE_OBSERVATION_TO_FILE_TOKEN_THRESHOLD: int = 5_000
 
     # Parallel Execution
-    MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", "4"))
+    MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", "2"))
     ENABLE_PARALLEL_TOOLS: bool = os.getenv("ENABLE_PARALLEL_TOOLS", "true").lower() == "true"
 
     # Advanced Features
@@ -177,7 +177,7 @@ class AgentConfig:
 
     # Cost Tracking
     TRACK_COST: bool = True
-    MAX_COST_USD: float = float(os.getenv("MAX_COST_USD", "10.0"))
+    MAX_COST_USD: float = float(os.getenv("MAX_COST_USD", "2.0"))
 
     @classmethod
     def validate(cls) -> None:
