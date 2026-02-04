@@ -100,37 +100,61 @@ def setup_colored_logging(level: str = "INFO") -> logging.Logger:
 logger = setup_colored_logging()
 
 # =============================================================================
-# CONFIGURATION & CONSTANTS
+# CONFIGURATION & CONSTANTS (from current_top.py)
 # =============================================================================
+
+# Model definitions (from current_top.py lines 48-50)
+@dataclass
+class Model:
+    name: str
+    timeout: int
+
+# Problem types
+PROBLEM_TYPE_CREATE = "CREATE"
+PROBLEM_TYPE_FIX = "FIX"
+
+# Model definitions (from current_top.py lines 54-60)
+GLM_MODEL_NAME = Model(name="zai-org/GLM-4.6-FP8", timeout=150)
+QWEN_MODEL_NAME = Model(name="Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8", timeout=100)
+GLM_OLD_MODEL_NAME = Model(name="zai-org/GLM-4.5-FP8", timeout=150)
+DEEPSEEK_MODEL_NAME = Model(name="deepseek-ai/DeepSeek-V3-0324", timeout=50)
+KIMI_MODEL_NAME = Model(name="moonshotai/Kimi-K2-Instruct", timeout=60)
+DEEPSEEK_MODEL_NAME = GLM_MODEL_NAME
+KIMI_MODEL_NAME = QWEN_MODEL_NAME
+
+# Agent models list (repeated twice like current_top.py line 66)
+AGENT_MODELS = [model for model in [GLM_MODEL_NAME, GLM_OLD_MODEL_NAME, KIMI_MODEL_NAME, QWEN_MODEL_NAME] for _ in range(2)]
 
 class AgentConfig:
     """Centralized configuration for the improved agent."""
 
-    # Model Configuration
-    PRIMARY_MODEL: str = os.getenv("PRIMARY_MODEL", "claude-sonnet-4")
-    FALLBACK_MODELS: List[str] = [
-        "claude-3-5-sonnet-20241022",
-        "gpt-4o",
-        "gemini-2.0-flash-exp",
-    ]
+    # Model Configuration (from current_top.py)
+    PRIMARY_MODEL: str = os.getenv("PRIMARY_MODEL", AGENT_MODELS[0].name)
+    FALLBACK_MODELS: List[str] = [model.name for model in AGENT_MODELS[1:]]  # All other models
 
-    # API Configuration (Ridges-compatible)
-    SANDBOX_PROXY_URL: str = os.getenv("SANDBOX_PROXY_URL", "http://localhost:8000")
+    # API Configuration (Ridges-compatible, from current_top.py line 61)
+    SANDBOX_PROXY_URL: str = os.getenv("SANDBOX_PROXY_URL", "http://sandbox_proxy")
     API_URL: str = SANDBOX_PROXY_URL
-    API_TIMEOUT: int = int(os.getenv("API_TIMEOUT", "120"))
+    DEFAULT_TIMEOUT: int = int(os.getenv("AGENT_TIMEOUT", "1500"))  # From current_top.py line 62
+    API_TIMEOUT: int = DEFAULT_TIMEOUT
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "5"))
 
-    # Execution Limits
-    MAX_STEPS: int = int(os.getenv("MAX_STEPS", "100"))
+    # Execution Limits (from current_top.py line 63)
+    MAX_FIX_TASK_STEPS: int = int(os.getenv("MAX_FIX_TASK_STEPS", "200"))
+    MAX_STEPS: int = int(os.getenv("MAX_STEPS", str(MAX_FIX_TASK_STEPS)))  # Default to MAX_FIX_TASK_STEPS
     MAX_DURATION: int = int(os.getenv("MAX_DURATION", "1800"))
     MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "8192"))
 
     # Context Management (EnhancedCOT settings)
     CONTEXT_WINDOW: int = int(os.getenv("CONTEXT_WINDOW", "200000"))
     SUMMARY_THRESHOLD: int = int(os.getenv("SUMMARY_THRESHOLD", "50000"))
-    LATEST_OBSERVATIONS_TO_KEEP: int = int(os.getenv("LATEST_OBSERVATIONS_TO_KEEP", "15"))
-    SUMMARIZE_BATCH_SIZE: int = int(os.getenv("SUMMARIZE_BATCH_SIZE", "5"))
-    MAX_SUMMARY_RANGES: int = int(os.getenv("MAX_SUMMARY_RANGES", "6"))
+    LATEST_OBSERVATIONS_TO_KEEP: int = int(os.getenv("LATEST_OBSERVATIONS_TO_KEEP", "15"))  # From current_top.py line 64
+    SUMMARIZE_BATCH_SIZE: int = int(os.getenv("SUMMARIZE_BATCH_SIZE", "5"))  # From current_top.py line 79
+    MAX_SUMMARY_RANGES: int = int(os.getenv("MAX_SUMMARY_RANGES", "6"))  # From current_top.py line 65
+
+    # Additional constants from current_top.py lines 80-81
+    REJECT_OBSERVATION_TOKEN_THRESHOLD: int = 50_000
+    SAVE_OBSERVATION_TO_FILE_TOKEN_THRESHOLD: int = 5_000
 
     # Parallel Execution
     MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", "4"))
