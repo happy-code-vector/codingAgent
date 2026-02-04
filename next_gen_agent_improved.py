@@ -1283,6 +1283,348 @@ class RunTestsTool(Tool):
             raise ToolException(f"Test execution failed: {e}", ToolErrorType.RUNTIME_ERROR)
 
 # =============================================================================
+# GIT STATE MANAGER (from current_top.py)
+# =============================================================================
+
+class GitStateManager:
+    """
+    Manages git state with stash and rollback capabilities.
+
+    Allows safe experimentation with the ability to roll back changes.
+    """
+
+    def __init__(self, repo_path: str = AgentConfig.REPO_PATH):
+        self.repo_path = Path(repo_path)
+        self.stash_history: List[Dict[str, Any]] = []
+        self.original_cwd = os.getcwd()
+
+    def _run_git(self, args: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
+        """Run a git command in the repo directory."""
+        return subprocess.run(
+            ["git"] + args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=self.repo_path,
+            check=False
+        )
+
+    def init_git(self) -> None:
+        """Initialize git repository if not exists."""
+        if not (self.repo_path / ".git").exists():
+            logger.info("Initializing git repository...")
+            self._run_git(["init"], timeout=10)
+            self._run_git(["config", "user.email", "agent@ridges.ai"], timeout=5)
+            self._run_git(["config", "user.name", "Ridges Agent"], timeout=5)
+            self._run_git(["add", "-A"], timeout=30)
+            self._run_git(["commit", "-m", "Initial commit"], timeout=30)
+
+    def stash_changes(self, message: str = "temp_stash") -> str:
+        """
+        Stash current changes with a message.
+
+        Returns:
+            Stash reference (e.g., "stash@{0}")
+        """
+        try:
+            # Stage all changes first
+            self._run_git(["add", "-A"], timeout=30)
+
+            # Check if there are changes to stash
+            status = self._run_git(["status", "--porcelain"], timeout=10)
+            if not status.stdout.strip():
+                logger.info("No changes to stash")
+                return ""
+
+            # Create stash
+            result = self._run_git(["stash", "push", "-m", message], timeout=30)
+
+            # Get stash ref
+            stash_list = self._run_git(["stash", "list"], timeout=10)
+            stash_ref = "stash@{0}"
+
+            self.stash_history.append({
+                "ref": stash_ref,
+                "message": message,
+                "timestamp": time.time(),
+            })
+
+            logger.info(f"Stashed changes: {message}")
+            return stash_ref
+
+        except Exception as e:
+            logger.error(f"Failed to stash changes: {e}")
+            return ""
+
+    def get_stash_patch(self, stash_ref: str = "stash@{0}") -> Optional[str]:
+        """
+        Get the patch for a stashed change.
+
+        Returns:
+            Git diff string or None
+        """
+        try:
+            result = self._run_git([
+                "stash", "show", "-p", "--no-color", "--unified=5", stash_ref
+            ], timeout=30)
+
+            if result.returncode == 0:
+                return result.stdout
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to get stash patch: {e}")
+            return None
+
+    def pop_stash(self, stash_ref: str = "stash@{0}") -> bool:
+        """
+        Pop and apply a stashed change.
+
+        Returns:
+            True if successful
+        """
+        try:
+            result = self._run_git(["stash", "pop"], timeout=30)
+            success = result.returncode == 0
+
+            if success:
+                # Remove from history
+                self.stash_history = [s for s in self.stash_history if s["ref"] != stash_ref]
+                logger.info(f"Restored stash: {stash_ref}")
+
+            return success
+
+        except Exception as e:
+            logger.error(f"Failed to pop stash: {e}")
+            return False
+
+    def reset_hard(self, commit: str = "HEAD") -> bool:
+        """
+        Reset repository to a commit (discarding all changes).
+
+        Returns:
+            True if successful
+        """
+        try:
+            result = self._run_git(["reset", "--hard", commit], timeout=30)
+            success = result.returncode == 0
+
+            if success:
+                logger.info(f"Reset to {commit}")
+
+            return success
+
+        except Exception as e:
+            logger.error(f"Failed to reset: {e}")
+            return False
+
+    def clean(self) -> bool:
+        """
+        Clean untracked files.
+
+        Returns:
+            True if successful
+        """
+        try:
+            result = self._run_git(["clean", "-fd"], timeout=30)
+            success = result.returncode == 0
+
+            if success:
+                logger.info("Cleaned untracked files")
+
+            return success
+
+        except Exception as e:
+            logger.error(f"Failed to clean: {e}")
+            return False
+
+    def get_current_diff(self) -> str:
+        """
+        Get current git diff (staged changes).
+
+        Returns:
+            Git diff string
+        """
+        try:
+            # Stage all changes
+            self._run_git(["add", "-A"], timeout=30)
+
+            # Get diff
+            result = self._run_git([
+                "diff", "--cached", "--unified=5", "--no-color"
+            ], timeout=30)
+
+            return result.stdout.strip()
+
+        except Exception as e:
+            logger.error(f"Failed to get diff: {e}")
+            return ""
+
+# =============================================================================
+# PARALLEL EXECUTOR (from current_top.py)
+# =============================================================================
+
+class ParallelExecutor:
+    """
+    Parallel execution manager for tools and solution generation.
+
+    Runs multiple operations in parallel using ThreadPoolExecutor.
+    """
+
+    def __init__(self, max_workers: int = AgentConfig.MAX_WORKERS):
+        self.max_workers = max_workers
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+
+    def execute_tools_parallel(
+        self,
+        tool_calls: List[Callable[[], str]],
+        timeout: Optional[float] = None,
+    ) -> List[Tuple[str, Optional[Exception]]]:
+        """
+        Execute multiple tools in parallel.
+
+        Args:
+            tool_calls: List of callable tools
+            timeout: Maximum time to wait for all tools
+
+        Returns:
+            List of (result, exception) tuples
+        """
+        results = []
+
+        try:
+            # Submit all tasks
+            futures = {
+                self.executor.submit(tool_call): i
+                for i, tool_call in enumerate(tool_calls)
+            }
+
+            # Wait for completion with timeout
+            for future in as_completed(futures, timeout=timeout):
+                try:
+                    result = future.result()
+                    results.append((result, None))
+                except Exception as e:
+                    results.append(("", e))
+
+        except TimeoutException:
+            logger.warning(f"Parallel execution timed out after {timeout}s")
+            # Cancel remaining futures
+            for future in futures:
+                future.cancel()
+
+        return results
+
+    def generate_solutions_parallel(
+        self,
+        problem_statement: str,
+        generator_fn: Callable[[str, int], Tuple[str, bool]],
+        num_attempts: int = 5,
+        timeout_per_attempt: float = 120.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate multiple solutions in parallel.
+
+        Args:
+            problem_statement: The problem to solve
+            generator_fn: Function that generates a solution (takes problem, attempt_num)
+            num_attempts: Number of parallel attempts
+            timeout_per_attempt: Timeout for each attempt
+
+        Returns:
+            List of solution dicts with 'solution', 'attempt', 'success', 'patch'
+        """
+        logger.info(f"Starting parallel solution generation: {num_attempts} attempts")
+
+        solutions = []
+
+        def attempt_generator(attempt_num: int) -> Dict[str, Any]:
+            """Generate a single solution attempt."""
+            start_time = time.time()
+            try:
+                solution, success = generator_fn(problem_statement, attempt_num)
+                elapsed = time.time() - start_time
+
+                return {
+                    "attempt": attempt_num,
+                    "solution": solution,
+                    "success": success,
+                    "elapsed": elapsed,
+                }
+            except Exception as e:
+                elapsed = time.time() - start_time
+                logger.error(f"Attempt {attempt_num} failed: {e}")
+                return {
+                    "attempt": attempt_num,
+                    "solution": "",
+                    "success": False,
+                    "elapsed": elapsed,
+                    "error": str(e),
+                }
+
+        try:
+            # Submit all attempts in parallel
+            futures = {
+                self.executor.submit(attempt_generator, i): i
+                for i in range(num_attempts)
+            }
+
+            # Collect results as they complete
+            for future in as_completed(futures, timeout=timeout_per_attempt):
+                try:
+                    solution = future.result()
+                    solutions.append(solution)
+
+                    # If we found a successful solution, we can stop
+                    if solution.get("success"):
+                        logger.info(f"Found successful solution at attempt {solution['attempt']}")
+                        # Don't break - let other attempts finish for comparison
+
+                except Exception as e:
+                    logger.error(f"Parallel generation error: {e}")
+
+        except TimeoutException:
+            logger.warning(f"Parallel generation timed out after {timeout_per_attempt}s")
+
+        # Sort by success and elapsed time
+        solutions.sort(key=lambda s: (not s.get("success", False), s.get("elapsed", float('inf'))))
+
+        logger.info(f"Parallel generation complete: {len(solutions)} solutions")
+        return solutions
+
+    def select_best_solution(
+        self,
+        solutions: List[Dict[str, Any]],
+        problem_statement: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Select the best solution from multiple attempts.
+
+        Uses simple heuristics:
+        1. Prefer successful solutions
+        2. Prefer shorter elapsed time
+        3. Prefer longer solutions (more complete)
+        """
+        if not solutions:
+            return None
+
+        # Filter successful solutions
+        successful = [s for s in solutions if s.get("success")]
+
+        if successful:
+            # Among successful, pick the one with longest solution (most complete)
+            successful.sort(key=lambda s: len(s.get("solution", "")), reverse=True)
+            return successful[0]
+
+        # If no successful solutions, return the one that made the most progress
+        solutions.sort(key=lambda s: len(s.get("solution", "")), reverse=True)
+        return solutions[0] if solutions else None
+
+    def shutdown(self) -> None:
+        """Shutdown the executor."""
+        self.executor.shutdown(wait=True)
+
+# =============================================================================
 # MAIN IMPROVED AGENT
 # =============================================================================
 
@@ -1300,16 +1642,21 @@ class NextGenAgentImproved:
         self,
         api_url: str = AgentConfig.API_URL,
         primary_model: str = AgentConfig.PRIMARY_MODEL,
+        repo_path: str = AgentConfig.REPO_PATH,
     ):
         # Core components
         self.cot = EnhancedCOT(
             latest_observations_to_keep=AgentConfig.LATEST_OBSERVATIONS_TO_KEEP,
             summarize_batch_size=AgentConfig.SUMMARIZE_BATCH_SIZE
         )
-        self.impact_analyzer = ChangedImpactAnalyzer() if AgentConfig.ENABLE_CHANGE_IMPACT_ANALYSIS else None
-        self.verifier = SolutionVerifier() if AgentConfig.ENABLE_SOLUTION_VERIFICATION else None
+        self.impact_analyzer = ChangedImpactAnalyzer(repo_path) if AgentConfig.ENABLE_CHANGE_IMPACT_ANALYSIS else None
+        self.verifier = SolutionVerifier(repo_path) if AgentConfig.ENABLE_SOLUTION_VERIFICATION else None
         self.mcts = MCTS() if AgentConfig.ENABLE_MCTS else None
         self.reflection = SelfReflection() if AgentConfig.ENABLE_SELF_REFLECTION else None
+
+        # NEW: Production features from current_top.py
+        self.git_manager = GitStateManager(repo_path)
+        self.parallel_executor = ParallelExecutor(max_workers=AgentConfig.MAX_WORKERS)
 
         # Tool system
         self.tools = ToolRegistry()
@@ -1320,6 +1667,9 @@ class NextGenAgentImproved:
         self.step_count = 0
         self.start_time: Optional[float] = None
         self.modified_files: List[str] = []
+
+        # Initialize git
+        self.git_manager.init_git()
 
         logger.info("NextGenAgentImproved initialized")
 
@@ -1426,6 +1776,140 @@ class NextGenAgentImproved:
 
         return last_result
 
+    def run_parallel(
+        self,
+        problem_statement: str,
+        num_attempts: int = 5,
+        max_duration: int = AgentConfig.MAX_DURATION,
+    ) -> str:
+        """
+        Run the agent with parallel solution generation.
+
+        Generates multiple solutions in parallel and selects the best one.
+
+        Args:
+            problem_statement: The problem to solve
+            num_attempts: Number of parallel solution attempts
+            max_duration: Maximum time in seconds
+
+        Returns:
+            Final result or patch
+        """
+        global run_id, agent_start_time
+        agent_start_time = time.time()
+        run_id = os.getenv("EVALUATION_RUN_ID", str(uuid4()))
+
+        self.start_time = time.time()
+        logger.info(f"Starting parallel execution: {problem_statement[:100]}")
+
+        def generate_single_attempt(problem: str, attempt_num: int) -> Tuple[str, bool]:
+            """Generate a single solution attempt."""
+            # Stash current state
+            stash_ref = self.git_manager.stash_changes(f"attempt_{attempt_num}")
+
+            try:
+                # Reset to clean state
+                self.git_manager.reset_hard()
+                self.git_manager.clean()
+
+                # Run the agent
+                result = self.run(problem, max_steps=AgentConfig.MAX_STEPS // num_attempts)
+
+                # Get the patch
+                patch = self.git_manager.get_current_diff()
+                success = bool(patch)
+
+                return result or patch, success
+
+            except Exception as e:
+                logger.error(f"Attempt {attempt_num} failed: {e}")
+                return "", False
+            finally:
+                # Restore original state
+                if stash_ref:
+                    self.git_manager.reset_hard()
+                    # Don't pop - we want to keep each attempt separate for comparison
+
+        # Generate solutions in parallel
+        solutions = self.parallel_executor.generate_solutions_parallel(
+            problem_statement=problem_statement,
+            generator_fn=generate_single_attempt,
+            num_attempts=num_attempts,
+            timeout_per_attempt=max_duration / num_attempts,
+        )
+
+        # Select best solution
+        best = self.parallel_executor.select_best_solution(solutions, problem_statement)
+
+        if best:
+            logger.info(f"Selected best solution from attempt {best['attempt']}")
+
+            # Apply the best solution
+            if best.get("solution"):
+                return best["solution"]
+
+        return ""
+
+    def execute_tools_parallel(
+        self,
+        tool_calls: List[Dict[str, Any]],
+    ) -> List[ToolResult]:
+        """
+        Execute multiple tools in parallel.
+
+        Args:
+            tool_calls: List of tool call dicts with 'name' and 'arguments'
+
+        Returns:
+            List of ToolResult objects
+        """
+        results = []
+
+        def execute_single(call: Dict[str, Any]) -> ToolResult:
+            """Execute a single tool call."""
+            tool_name = call.get("name")
+            args = call.get("arguments", {})
+
+            start_time = time.time()
+            tool_call_id = str(uuid4())
+
+            try:
+                result = self.tools.execute(tool_name, **args)
+                return ToolResult(
+                    tool_call_id=tool_call_id,
+                    content=result,
+                    is_error=False,
+                    execution_time=time.time() - start_time,
+                )
+            except Exception as e:
+                return ToolResult(
+                    tool_call_id=tool_call_id,
+                    content=str(e),
+                    is_error=True,
+                    error_type="execution_error",
+                    execution_time=time.time() - start_time,
+                )
+
+        # Create callable list
+        callables = [lambda c=call: execute_single(c) for call in tool_calls]
+
+        # Execute in parallel
+        raw_results = self.parallel_executor.execute_tools_parallel(callables)
+
+        # Process results
+        for i, (result, error) in enumerate(raw_results):
+            if error:
+                results.append(ToolResult(
+                    tool_call_id=str(i),
+                    content=str(error),
+                    is_error=True,
+                    error_type="parallel_error",
+                ))
+            else:
+                results.append(result)
+
+        return results
+
     def _detect_problem_type(self, statement: str) -> ProblemType:
         """Detect the type of problem."""
         statement_lower = statement.lower()
@@ -1477,7 +1961,16 @@ When you've completed the fix, clearly state: "The fix is complete:" followed by
             "duration": time.time() - self.start_time if self.start_time else 0,
             "tool_stats": self.tools.get_stats(),
             "cost_info": EnhancedNetwork.get_cost_usage() if AgentConfig.TRACK_COST else {},
+            "git_stash_count": len(self.git_manager.stash_history),
         }
+
+    def cleanup(self) -> None:
+        """Cleanup resources."""
+        try:
+            self.parallel_executor.shutdown()
+            logger.info("Agent cleaned up successfully")
+        except Exception as e:
+            logger.error(f"Cleanup failed: {e}")
 
 # =============================================================================
 # RIDGES ENTRY POINT
@@ -1493,6 +1986,7 @@ def agent_main(input_dict: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Dict with 'patch' key containing git diff
     """
+    agent = None
     try:
         repo_path = input_dict.get("repo_path", AgentConfig.REPO_PATH)
         problem_statement = input_dict.get("problem", "")
@@ -1502,17 +1996,34 @@ def agent_main(input_dict: Dict[str, Any]) -> Dict[str, Any]:
 
         AgentConfig.REPO_PATH = repo_path
 
-        agent = NextGenAgentImproved(api_url=AgentConfig.API_URL)
-        result = agent.run(problem_statement)
+        # Create agent
+        agent = NextGenAgentImproved(api_url=AgentConfig.API_URL, repo_path=repo_path)
 
-        # Generate git diff
-        patch = generate_git_diff(repo_path)
+        # Detect problem type to decide execution strategy
+        problem_type = agent._detect_problem_type(problem_statement)
+
+        # Use parallel execution for CREATE tasks (faster, better solutions)
+        if problem_type == ProblemType.CREATE and AgentConfig.MAX_WORKERS > 1:
+            logger.info("Using parallel execution for CREATE task")
+            result = agent.run_parallel(
+                problem_statement,
+                num_attempts=min(3, AgentConfig.MAX_WORKERS),  # Up to 3 parallel attempts
+                max_duration=AgentConfig.MAX_DURATION,
+            )
+        else:
+            result = agent.run(problem_statement)
+
+        # Generate git diff using git manager
+        patch = agent.git_manager.get_current_diff()
 
         return {"patch": patch}
 
     except Exception as e:
         logger.error(f"Agent execution failed: {e}", exc_info=True)
         return {"patch": ""}
+    finally:
+        if agent:
+            agent.cleanup()
 
 
 def generate_git_diff(repo_path: str) -> str:
@@ -1558,10 +2069,17 @@ def main():
     parser.add_argument("--repo-path", default=AgentConfig.REPO_PATH)
     parser.add_argument("--api-url", default=AgentConfig.API_URL)
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--parallel", action="store_true", help="Use parallel execution (for CREATE tasks)")
+    parser.add_argument("--max-workers", type=int, default=AgentConfig.MAX_WORKERS, help="Max parallel workers")
 
     args = parser.parse_args()
 
     setup_colored_logging(args.log_level)
+
+    # Update config based on args
+    AgentConfig.REPO_PATH = args.repo_path
+    AgentConfig.API_URL = args.api_url
+    AgentConfig.MAX_WORKERS = args.max_workers
 
     input_dict = {
         "repo_path": args.repo_path,
